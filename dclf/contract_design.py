@@ -1,7 +1,8 @@
+import itertools
+import time
+
 import numpy as np
 import pyomo.environ as pe
-
-import itertools
 
 from .common_types import *
 from .agent_simulation import *
@@ -9,7 +10,8 @@ from .agent_simulation import *
 __all__ = [
     'MinBudgetContract',
     'MinBudgetStatisticalContract',
-    'MinBudgetLocalContract',
+    'MinBudgetSingleBindingActionContract',
+    'MinBudgetHybridContract',
     'FixedBudgetThresholdContract',
     'FullEnumerationContract',
     'MinPayContract',
@@ -18,30 +20,47 @@ __all__ = [
 opt = pe.SolverFactory('glpk')
 opt.options ={'tmlim':10}
 
-EPS = 1e-6
+EPS = 1e-9
 
 def extract_variable(model, var_name):
     return np.array([v.value for v in list(getattr(model,var_name).values())])
+
+def alternative_actions(f_ij, target):
+    mean_acc = f_ij@np.arange(f_ij.shape[1])
+    n = len(f_ij)
+    return [i for i in range(n) if i!=target and mean_acc[i]<mean_acc[target]]
 
 class LPContract:
     @classmethod
     def design(cls, design_problem, target_action=-1, **kwargs):
         assert len(design_problem.f_ij)==len(design_problem.cost)
         assert (np.abs(design_problem.f_ij.sum(axis=1)-1)<=1e-6).all()
-        selected_ind = target_action+1 if target_action!=-1 else len(design_problem.f_ij)
-        f_ij = design_problem.f_ij[:selected_ind]
-        cost = design_problem.cost[:selected_ind]
-        return cls.solve(f_ij, cost, **kwargs)
+        target_action %= len(design_problem.f_ij)
+        # n = len(design_problem.f_ij)
+        # selected_ind = target_action+1 if target_action!=-1 else n
+        # f_ij = design_problem.f_ij[:selected_ind]
+        # cost = design_problem.cost[:selected_ind]
+        start_time = time.time()
+        # result = cls.solve(f_ij, cost, **kwargs)
+        result = cls.solve(
+            f_ij=design_problem.f_ij, 
+            cost=design_problem.cost, 
+            target=target_action,
+            **kwargs,
+        )
+        end_time = time.time()
+        result['wall_time'] = end_time-start_time
+        return result
         
 
 class MinBudgetContract(LPContract):
     @classmethod
-    def solve(cls, f_ij, cost, **kwargs):
+    def solve(cls, f_ij, cost, target):
         methods = {
             'primal': cls.primal,
             'dual': cls.dual,
         }
-        results = {m: f(f_ij,cost) for m,f in methods.items()}
+        results = {m: f(f_ij,cost,target) for m,f in methods.items()}
         return {
             f'{m}_{k}': v
             for m,dct in results.items()
@@ -51,15 +70,16 @@ class MinBudgetContract(LPContract):
         }
 
     @staticmethod
-    def primal(f_ij, cost):
+    def primal(f_ij, cost, target):
         n,m = f_ij.shape
+        i_vec = alternative_actions(f_ij, target)
         j_vec = np.arange(m)
         model = pe.ConcreteModel()
         model.t = pe.Var(j_vec, within=pe.NonNegativeReals)
         model.B = pe.Var(within=pe.NonNegativeReals)
         model.ic = pe.Constraint(
-            range(n-1),
-            rule=lambda model, i: sum((f_ij[n-1,j]-f_ij[i,j])*model.t[j] for j in j_vec) >= cost[n-1]-cost[i],
+            i_vec,
+            rule=lambda model, i: sum((f_ij[target,j]-f_ij[i,j])*model.t[j] for j in j_vec) >= cost[target]-cost[i],
         )
         model.budget = pe.Constraint(
             j_vec,
@@ -78,22 +98,22 @@ class MinBudgetContract(LPContract):
         }
 
     @staticmethod
-    def dual(f_ij, cost):
+    def dual(f_ij, cost, target):
         n,m = f_ij.shape
-        i_vec = np.arange(n-1)
+        i_vec = alternative_actions(f_ij, target)
         j_vec = np.arange(m)
         model = pe.ConcreteModel()
         model.lambd = pe.Var(i_vec, within=pe.NonNegativeReals)
         model.mu = pe.Var(j_vec, within=pe.NonNegativeReals)
         model.f_constraint = pe.Constraint(
             j_vec,
-            rule=lambda model, j: sum((f_ij[n-1,j]-f_ij[i,j])*model.lambd[i] for i in i_vec) <= model.mu[j],
+            rule=lambda model, j: sum((f_ij[target,j]-f_ij[i,j])*model.lambd[i] for i in i_vec) <= model.mu[j],
         )
         model.mu_sum_constraint = pe.Constraint(
             expr=sum(model.mu[j] for j in j_vec) <= 1,
         )
         model.obj = pe.Objective(
-            expr=sum((cost[n-1]-cost[i])*model.lambd[i] for i in i_vec),
+            expr=sum((cost[target]-cost[i])*model.lambd[i] for i in i_vec),
             sense=pe.maximize,
         )
         result = opt.solve(model)
@@ -108,25 +128,26 @@ class MinBudgetContract(LPContract):
 
 class MinBudgetStatisticalContract(LPContract):
     @classmethod
-    def solve(cls, f_ij, cost, binary_domain, monotone):
+    def solve(cls, f_ij, cost, target, binary_domain, monotone):
         phi_domain = pe.Binary if binary_domain else pe.PercentFraction
-        return cls.statistical_primal(f_ij,cost,phi_domain=phi_domain,monotone=monotone)
+        return cls.statistical_primal(f_ij, cost, target, phi_domain=phi_domain, monotone=monotone)
 
     @staticmethod
-    def statistical_primal(f_ij, cost, phi_domain, monotone):
+    def statistical_primal(f_ij, cost, target, phi_domain, monotone):
         n,m = f_ij.shape
+        i_vec = alternative_actions(f_ij, target)
         j_vec = np.arange(m)
         model = pe.ConcreteModel()
         model.phi = pe.Var(j_vec, within=phi_domain) # pe.PercentFraction or pe.Binary
         model.beta = pe.Var(within=pe.NonNegativeReals)
         model.ic = pe.Constraint(
-            range(n-1),
+            i_vec,
             rule=lambda model, i: (
                 sum(
-                    f_ij[n-1,j]*(1-model.phi[j])
+                    f_ij[target,j]*(1-model.phi[j])
                     + f_ij[i,j]*model.phi[j]
                     for j in j_vec
-                ) <= 1-(cost[n-1]-cost[i])*model.beta
+                ) <= 1-(cost[target]-cost[i])*model.beta
             ),
         )
         if monotone:
@@ -153,43 +174,56 @@ class MinBudgetStatisticalContract(LPContract):
         }
 
 
-class MinBudgetLocalContract(LPContract):
+class MinBudgetSingleBindingActionContract(LPContract):
     @classmethod
-    def solve(cls, f_ij, cost, compare_to_all=True, eps=EPS):
+    def solve(cls, f_ij, cost, target, compare_to_all=True, eps=EPS):
         n = len(f_ij)
-        if compare_to_all:
-            compare_ind = range(n-1)
-        else:
-            compare_ind = [n-2]
+        i_vec = [target-1] + [i for i in range(n) if i not in [target, target-1]]
 
-        min_B = None
-        opt_t = None
-        binding_action = None
-        for i in compare_ind:
-            d_cost = cost[-1]-cost[i]
-            tv = cls.tv_distance(f_ij[-1], f_ij[i])
+        for i in i_vec:
+            d_cost = cost[target]-cost[i]
+            if d_cost<0:
+                continue
+            tv = cls.tv_distance(f_ij[target], f_ij[i])
             B = d_cost/tv
-            t = (f_ij[-1]>=f_ij[i])*B
-            ic_constraint = f_ij@t-cost <= f_ij[-1]@t-cost[-1] + eps
+            assert B>=0
+            t = (f_ij[target]>=f_ij[i])*B
+            ic_constraint = f_ij@t-cost <= f_ij[target]@t-cost[target] + eps
             is_feasible = ic_constraint.all()
-            if is_feasible and (min_B is None or B<=min_B):
-                min_B = B
-                opt_t = t
-                binding_action = i
+            if is_feasible:
+                return {
+                    't': t,
+                    'budget': B,
+                    'binding_action': i,
+                }
 
-        if min_B is None:
-            raise RuntimeError('Local min budget contract design failed to find a solution')
-
-        return {
-            't': opt_t,
-            'budget': min_B,
-            'binding_action': binding_action,
-        }
+        raise RuntimeError('Local min budget contract design failed to find a solution')
 
     @staticmethod
     def tv_distance(p,q):
         return np.abs(p-q).sum()/2
 
+
+class MinBudgetHybridContract(LPContract):
+    @classmethod
+    def solve(cls, f_ij, cost, target, local_solver_kwargs={}, lp_solver_kwargs={}):
+        try:
+            result = MinBudgetSingleBindingActionContract.solve(
+                f_ij=f_ij, 
+                cost=cost,
+                target=target,
+                **local_solver_kwargs,
+            )
+            result['solver'] = 'sba'
+        except RuntimeError:
+            result = MinBudgetContract.solve(
+                f_ij=f_ij, 
+                cost=cost,
+                target=target,
+                **lp_solver_kwargs,
+            )
+            result['solver'] = 'lp'
+        return result
 
 
 class FixedBudgetThresholdContract:
@@ -210,10 +244,13 @@ class FixedBudgetThresholdContract:
 
 class FullEnumerationContract(LPContract):
     @classmethod
-    def solve(cls, f_ij, cost, monotone):
+    def solve(cls, f_ij, cost, target, monotone):
         n,m = f_ij.shape
-        dc = cost[-1] - np.array(cost[:-1])
-        df = f_ij[-1] - f_ij[:-1]
+        dc = cost[target] - cost
+        df = f_ij[target] - f_ij
+        pred = alternative_actions(f_ij, target)
+        dc = dc[pred]
+        df = df[pred]
         best_ratio = None
         best_phi = None
         if monotone:
@@ -238,17 +275,18 @@ class FullEnumerationContract(LPContract):
 
 class MinPayContract(LPContract):
     @staticmethod
-    def solve(f_ij, cost):
+    def solve(f_ij, cost, target):
         n,m = f_ij.shape
+        i_vec = [i for i in range(n) if i!=target]
         j_vec = np.arange(m)
         model = pe.ConcreteModel()
         model.t = pe.Var(j_vec, within=pe.NonNegativeReals)
         model.ic = pe.Constraint(
-            range(n-1),
-            rule=lambda model, i: sum((f_ij[n-1,j]-f_ij[i,j])*model.t[j] for j in j_vec) >= cost[n-1]-cost[i],
+            i_vec,
+            rule=lambda model, i: sum((f_ij[target,j]-f_ij[i,j])*model.t[j] for j in j_vec) >= cost[target]-cost[i],
         )
         model.obj = pe.Objective(
-            expr=sum(f_ij[n-1,j]*model.t[j] for j in j_vec),
+            expr=sum(f_ij[target,j]*model.t[j] for j in j_vec),
             sense=pe.minimize,
         )
         result = opt.solve(model)

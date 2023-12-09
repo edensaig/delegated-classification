@@ -19,16 +19,15 @@ class Contract:
 	metadata: typing.Optional[typing.Any]
 
 
-@dataclass
 class ContractDesignProblem:
-	f_ij: np.array  
-	cost: np.array
+	def __init__(self, f_ij, cost):
+		self.f_ij = np.array(f_ij)
+		self.cost = np.array(cost)
 
 	@property
 	def sf_ij(self):
 		" Survival function "
 		return 1-self.f_ij.cumsum(axis=1)
-
 
 
 class BootstrappedBinomialMixtureContractDesignProblem(ContractDesignProblem):
@@ -39,12 +38,12 @@ class BootstrappedBinomialMixtureContractDesignProblem(ContractDesignProblem):
 			acc_p.insert(0,[0.0])
 		self.has_zero_cost_action = (cost[0]==0)
 		self.acc_p = acc_p
-		self.m = m
 		f_ij = np.vstack([
 			self.binomial_mixture_distribution(v if isinstance(v, Iterable) else [v], m)
 			for v in acc_p
 		])
 		assert len(f_ij)==len(cost)
+		self.m = m
 		self.mean_acc = np.array([np.mean(v) for v in acc_p])
 		super().__init__(f_ij=f_ij, cost=cost)
 
